@@ -1,0 +1,94 @@
+from typing import Union
+import gradio as gr
+from huggingface_hub import InferenceClient, login
+import fitz  # PyMuPDF
+import io
+import re
+import logging
+from functools import lru_cache
+import backoff
+
+# Configuração de logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Configurações da API
+API_URL = 'https://api-inference.huggingface.co/models/mistralai/Mixtral-8x7B-Instruct-v0.1'
+API_KEY = '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'
+
+# Autenticação com Hugging Face Hub
+login(token=API_KEY)
+client = InferenceClient(model="mistralai/Mixtral-8x7B-Instruct-v0.1", token=API_KEY)
+
+@lru_cache(maxsize=100)
+def get_cached_analysis(prompt: str) -> str:
+    @backoff.on_exception(backoff.expo, Exception, max_tries=5, max_time=60)
+    def request_completion():
+        response_text = ""
+        messages = [{"role": "user", "content": prompt}]
+        for message in client.chat_completion(messages=messages, max_tokens=4000, temperature=0.3, stream=True):
+            if message.choices and message.choices[0].delta and message.choices[0].delta.content:
+                response_text += message.choices[0].delta.content
+        return response_text
+
+    return request_completion()
+
+def extract_text_from_pdf(file: Union[str, io.BytesIO, bytes]) -> str:
+    try:
+        doc = fitz.open(stream=file.read(), filetype="pdf") if isinstance(file, io.BytesIO) else fitz.open(file)
+        return "".join([page.get_text() for page in doc])
+    except Exception as e:
+        logger.error(f"Erro ao extrair texto do PDF: {str(e)}")
+        return f"Erro ao extrair texto do PDF: {str(e)}"
+
+def preprocess_text(text: str) -> str:
+    text = re.sub(r'\s+', ' ', text)  # Remove extra spaces
+    text = re.sub(r'Page \d+ of \d+|\f', '', text)  # Remove footer/page numbers
+    text = re.sub(r'[^\w\s.,;:%/\-()]', '', text)  # Keep only relevant punctuation
+    return text
+
+def analyze_blood_test(file: Union[str, io.BytesIO, bytes]) -> str:
+    try:
+        text = extract_text_from_pdf(file) if isinstance(file, (str, io.BytesIO, bytes)) else "Erro: Formato de arquivo não suportado."
+        if not text.strip():
+            return "Erro: O arquivo está vazio ou não foi possível extrair texto."
+
+        text = preprocess_text(text)
+        prompt = f"<s>[INST] Você é um especialista médico analisando um exame de sangue em português. Exame de sangue: {text} Sua análise em português: [/INST]"
+        full_analysis = get_cached_analysis(prompt)
+        
+        summary_prompt = f"<s>[INST] Com base na análise detalhada do exame de sangue, forneça um resumo conciso dos principais achados em português. Análise detalhada: {full_analysis} Resumo e recomendações em português: [/INST]"
+        summary = get_cached_analysis(summary_prompt)
+
+        return f"**Análise Detalhada**:\n\n{full_analysis}\n\n**Resumo e Recomendações**:\n\n{summary}"
+
+    except Exception as e:
+        logger.error(f"Erro ao processar o arquivo: {str(e)}")
+        return f"Erro ao processar o arquivo: {str(e)}"
+
+# Configuração da interface do Gradio
+iface = gr.Interface(
+    fn=analyze_blood_test,
+    inputs=[gr.File(label="Envie seu exame de sangue (PDF ou Texto)", type="filepath")],
+    outputs=gr.Textbox(label="Análise do Exame", lines=30),
+    title="Análise Automatizada de Exame de Sangue",
+    description="""
+    Esta ferramenta analisa automaticamente exames de sangue em português.
+    Envie um arquivo PDF ou TXT contendo os resultados do seu exame.
+    A análise inclui uma interpretação detalhada dos resultados, identificação de anomalias reais,
+    classificação de gravidade e recomendações gerais.
+
+    <b>Nota:</b> Esta ferramenta não substitui a avaliação de um profissional de saúde.
+    Sempre consulte seu médico para interpretação oficial dos resultados.
+    """,
+    allow_flagging="never",
+    live=False,
+    theme="default"
+)
+
+# Função para iniciar a interface
+def main():
+    iface.launch(server_name="0.0.0.0")
+
+if __name__ == "__main__":
+    main()
