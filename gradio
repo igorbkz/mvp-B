@@ -4,27 +4,36 @@ from huggingface_hub import InferenceClient, login
 import fitz  # PyMuPDF
 import io
 import logging
+import backoff
+
 
 # Configuração de logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Configurações da API
+API_URL = 'https://api-inference.huggingface.co/models/mistralai/Mixtral-8x7B-Instruct-v0.1'
 API_KEY = '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'
 
 # Autenticação com Hugging Face Hub
 login(token=API_KEY)
 
 client = InferenceClient(model="mistralai/Mixtral-8x7B-Instruct-v0.1", token=API_KEY)
+tokenizer = AutoTokenizer.from_pretrained("mistralai/Mixtral-8x7B-Instruct-v0.1")
 
-def get_analysis(prompt: str, max_new_tokens: int = 4000, temperature: float = 0.3) -> str:
-    """Obtém a resposta da API."""
-    response_text = ""
-    messages = [{"role": "user", "content": prompt}]
-    for message in client.chat_completion(messages=messages, max_tokens=max_new_tokens, temperature=temperature, stream=True):
-        if message.choices and message.choices[0].delta and message.choices[0].delta.content:
-            response_text += message.choices[0].delta.content
-    return response_text
+@lru_cache(maxsize=100)
+def get_cached_analysis(prompt: str, max_new_tokens: int = 4000, temperature: float = 0.3) -> str:
+    """Obtém a resposta da API com tentativas de repetição e caching."""
+    @backoff.on_exception(backoff.expo, Exception, max_tries=5, max_time=60)
+    def request_completion():
+        response_text = ""
+        messages = [{"role": "user", "content": prompt}]
+        for message in client.chat_completion(messages=messages, max_tokens=max_new_tokens, temperature=temperature, stream=True):
+            if message.choices and message.choices[0].delta and message.choices[0].delta.content:
+                response_text += message.choices[0].delta.content
+        return response_text
+
+    return request_completion()
 
 def extract_text_from_pdf(file: Union[str, io.BytesIO, bytes]) -> str:
     """Extrai texto de um arquivo PDF."""
@@ -49,41 +58,64 @@ def extract_text_from_pdf(file: Union[str, io.BytesIO, bytes]) -> str:
 def analyze_blood_test(file: Union[str, io.BytesIO, bytes]) -> str:
     """Realiza a análise do exame de sangue fornecido."""
     try:
-        text = extract_text_from_pdf(file) if isinstance(file, (str, io.BytesIO)) else file.read().decode('utf-8')
+        if isinstance(file, (str, io.BytesIO, bytes)):
+            text = extract_text_from_pdf(file) if isinstance(file, (str, io.BytesIO)) else file.read().decode('utf-8')
+        else:
+            return "Erro: Formato de arquivo não suportado."
 
         if not text.strip():
             return "Erro: O arquivo está vazio ou não foi possível extrair texto."
 
         prompt = f"""
-        Você é um especialista médico analisando um exame de sangue em português.
+        <s>[INST] Você é um especialista médico analisando um exame de sangue em português.
         Com base nos resultados fornecidos abaixo, forneça uma análise detalhada e precisa.
 
-        Instruções:
+        Instruções importantes:
         1. Compare cuidadosamente cada valor com sua faixa de referência correspondente.
         2. Identifique apenas as anomalias reais, onde o valor está fora da faixa de referência.
         3. Para cada anomalia encontrada, informe:
+           - O nome do exame
+           - O valor obtido
+           - A faixa de referência
+           - Se está acima ou abaixo da faixa
+           - A classificação da anomalia (leve, moderada ou grave)
+        4. Explique as possíveis implicações de cada anomalia para a saúde do paciente.
+        5. Não classifique como anomalia valores que estejam dentro da faixa de referência, mesmo que próximos aos limites.
+        6. Se não houver anomalias, informe que todos os valores estão dentro das faixas de referência.
+        7. Caso faltem informações ou valores de referência, indique claramente.
+
+        Exame de sangue:
+        {text}
+
+        Sua análise em português: [/INST]
+        """
+        full_analysis = get_cached_analysis(prompt)
+
+        summary_prompt = f"""
+        <s>[INST] Com base na análise detalhada do exame de sangue, forneça um resumo conciso dos principais achados em português.
+
+        Instruções para o resumo:
+        1. Liste apenas as anomalias reais encontradas, incluindo:
            - Nome do exame
            - Valor obtido
            - Faixa de referência
            - Se está acima ou abaixo da faixa
            - Classificação da anomalia (leve, moderada ou grave)
-        4. Explique as possíveis implicações de cada anomalia para a saúde do paciente.
-        5. Não classifique como anomalia valores que estejam dentro da faixa de referência, mesmo que próximos aos limites.
-        6. Se não houver anomalias, informe que todos os valores estão dentro das faixas de referência.
-        7. Caso faltem informações ou valores de referência, indique claramente.
-        8. Sugira possíveis condições de saúde relacionadas às anomalias encontradas, em ordem de probabilidade.
-        9. Recomende exames adicionais ou consultas com especialistas, se necessário.
-        10. Sugira mudanças no estilo de vida ou dieta, se aplicável.
-        11. Forneça uma escala de urgência para procurar atendimento médico (não urgente, pouco urgente, urgente, muito urgente).
+        2. Para cada anomalia, explique brevemente as possíveis implicações para a saúde.
+        3. Sugira possíveis condições de saúde relacionadas às anomalias encontradas, em ordem de probabilidade.
+        4. Recomende exames adicionais ou consultas com especialistas, se necessário.
+        5. Sugira mudanças no estilo de vida ou dieta, se aplicável.
+        6. Forneça uma escala de urgência para procurar atendimento médico (não urgente, pouco urgente, urgente, muito urgente).
+        7. Se não houver anomalias, informe claramente que todos os resultados estão dentro das faixas de referência.
 
-        Exame de sangue:
-        {text}
+        Análise detalhada:
+        {full_analysis}
 
-        Sua análise em português:
+        Resumo e recomendações em português: [/INST]
         """
-        analysis = get_analysis(prompt)
+        summary = get_cached_analysis(summary_prompt)
 
-        return f"**Análise Detalhada**:\n\n{analysis}"
+        return f"**Análise Detalhada**:\n\n{full_analysis}\n\n**Resumo e Recomendações**:\n\n{summary}"
 
     except Exception as e:
         logger.error(f"Erro ao processar o arquivo: {str(e)}")
