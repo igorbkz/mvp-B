@@ -1,47 +1,30 @@
-from typing import Union # Import Union from typing module
+from typing import Union
 import gradio as gr
 from huggingface_hub import InferenceClient, login
 import fitz  # PyMuPDF
 import io
-import re
 import logging
-import time
-from transformers import AutoTokenizer
-from functools import lru_cache
-import backoff
-
-# ... (rest of the code remains the same)
 
 # Configuração de logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Configurações da API
-API_URL = 'https://api-inference.huggingface.co/models/mistralai/Mixtral-8x7B-Instruct-v0.1'
 API_KEY = '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'
-MAX_TOKENS = 30000
 
 # Autenticação com Hugging Face Hub
 login(token=API_KEY)
 
 client = InferenceClient(model="mistralai/Mixtral-8x7B-Instruct-v0.1", token=API_KEY)
-tokenizer = AutoTokenizer.from_pretrained("mistralai/Mixtral-8x7B-Instruct-v0.1")
 
-@lru_cache(maxsize=100)
-def get_cached_analysis(prompt: str, max_new_tokens: int = 4000, temperature: float = 0.3) -> str:
-    """
-    Obtém a resposta da API com tentativas de repetição e caching.
-    """
-    @backoff.on_exception(backoff.expo, Exception, max_tries=5, max_time=60)
-    def request_completion():
-        response_text = ""
-        messages = [{"role": "user", "content": prompt}]
-        for message in client.chat_completion(messages=messages, max_tokens=max_new_tokens, temperature=temperature, stream=True):
-            if message.choices and message.choices[0].delta and message.choices[0].delta.content:
-                response_text += message.choices[0].delta.content
-        return response_text
-
-    return request_completion()
+def get_analysis(prompt: str, max_new_tokens: int = 4000, temperature: float = 0.3) -> str:
+    """Obtém a resposta da API."""
+    response_text = ""
+    messages = [{"role": "user", "content": prompt}]
+    for message in client.chat_completion(messages=messages, max_tokens=max_new_tokens, temperature=temperature, stream=True):
+        if message.choices and message.choices[0].delta and message.choices[0].delta.content:
+            response_text += message.choices[0].delta.content
+    return response_text
 
 def extract_text_from_pdf(file: Union[str, io.BytesIO, bytes]) -> str:
     """Extrai texto de um arquivo PDF."""
@@ -63,150 +46,53 @@ def extract_text_from_pdf(file: Union[str, io.BytesIO, bytes]) -> str:
         logger.error(f"Erro ao extrair texto do PDF: {str(e)}")
         return f"Erro ao extrair texto do PDF: {str(e)}"
 
-def preprocess_text(text: str) -> str:
-    """Pré-processa o texto removendo espaços desnecessários e caracteres especiais."""
-    text = re.sub(r'\s+', ' ', text)  # Remove extra spaces
-    text = re.sub(r'(?i)\bhemoglobina\b', 'Hb', text)  # Normalize terms
-    text = re.sub(r'Page \d+ of \d+|\f', '', text)  # Remove footer/page numbers
-    text = re.sub(r'[^\w\s.,;:%/\-()]', '', text)  # Keep only relevant punctuation
-    return text
-
-def normalize_value(value: str) -> float:
-    """Normalize numeric values to float, converting from comma to dot if necessary."""
-    return float(value.replace(',', '.'))
-
-def parse_reference_range(range_str: str) -> tuple:
-    """Parse and normalize a reference range from a string to a tuple of floats."""
-    try:
-        range_str = range_str.replace(',', '.').replace(' ', '')
-        parts = re.split(r'-|a', range_str)
-        if len(parts) == 2:
-            low, high = map(float, parts)
-            return (low, high)
-        elif 'oumaior' in range_str:
-            low = float(parts[0])
-            return (low, float('inf'))
-        elif 'oumenor' in range_str:
-            high = float(parts[0])
-            return (float('-inf'), high)
-        else:
-            return (float('-inf'), float('inf'))
-    except Exception as e:
-        logger.error(f"Erro ao analisar faixas de referência: {str(e)}")
-        return (float('-inf'), float('inf'))
-
-def detect_anomalies(value: float, reference_range: str) -> str:
-    """
-    Detecta anomalias comparando o valor com a faixa de referência.
-    """
-    try:
-        low, high = parse_reference_range(reference_range)
-        if value < low:
-            return f"Abaixo da faixa normal ({low} - {high})"
-        elif value > high:
-            return f"Acima da faixa normal ({low} - {high})"
-        else:
-            return "Normal"
-    except Exception as e:
-        logger.error(f"Erro ao analisar faixas de referência: {str(e)}")
-        return "Erro na faixa de referência"
-
 def analyze_blood_test(file: Union[str, io.BytesIO, bytes]) -> str:
     """Realiza a análise do exame de sangue fornecido."""
     try:
-        if isinstance(file, (str, io.BytesIO, bytes)):
-            if isinstance(file, str) or (hasattr(file, 'name') and file.name.lower().endswith('.pdf')):
-                text = extract_text_from_pdf(file)
-            else:
-                text = file.read().decode('utf-8') if isinstance(file, bytes) else extract_text_from_pdf(io.BytesIO(file))
-        else:
-            return "Erro: Formato de arquivo não suportado."
+        text = extract_text_from_pdf(file) if isinstance(file, (str, io.BytesIO)) else file.read().decode('utf-8')
 
         if not text.strip():
             return "Erro: O arquivo está vazio ou não foi possível extrair texto."
 
-        text = preprocess_text(text)
-        chunks = chunk_text(text)
-
-        combined_text = ' '.join(chunks)
         prompt = f"""
-        <s>[INST] Você é um especialista médico analisando um exame de sangue em português.
+        Você é um especialista médico analisando um exame de sangue em português.
         Com base nos resultados fornecidos abaixo, forneça uma análise detalhada e precisa.
 
-        Instruções importantes:
+        Instruções:
         1. Compare cuidadosamente cada valor com sua faixa de referência correspondente.
         2. Identifique apenas as anomalias reais, onde o valor está fora da faixa de referência.
         3. Para cada anomalia encontrada, informe:
-           - O nome do exame
-           - O valor obtido
-           - A faixa de referência
-           - Se está acima ou abaixo da faixa
-           - A classificação da anomalia (leve, moderada ou grave)
-        4. Explique as possíveis implicações de cada anomalia para a saúde do paciente.
-        5. Não classifique como anomalia valores que estejam dentro da faixa de referência, mesmo que próximos aos limites.
-        6. Se não houver anomalias, informe que todos os valores estão dentro das faixas de referência.
-        7. Caso faltem informações ou valores de referência, indique claramente.
-
-        Exame de sangue:
-        {combined_text}
-
-        Sua análise em português: [/INST]
-        """
-        full_analysis = get_cached_analysis(prompt)
-
-        summary_prompt = f"""
-        <s>[INST] Com base na análise detalhada do exame de sangue, forneça um resumo conciso dos principais achados em português.
-
-        Instruções para o resumo:
-        1. Liste apenas as anomalias reais encontradas, incluindo:
            - Nome do exame
            - Valor obtido
            - Faixa de referência
            - Se está acima ou abaixo da faixa
            - Classificação da anomalia (leve, moderada ou grave)
-        2. Para cada anomalia, explique brevemente as possíveis implicações para a saúde.
-        3. Sugira possíveis condições de saúde relacionadas às anomalias encontradas, em ordem de probabilidade.
-        4. Recomende exames adicionais ou consultas com especialistas, se necessário.
-        5. Sugira mudanças no estilo de vida ou dieta, se aplicável.
-        6. Forneça uma escala de urgência para procurar atendimento médico (não urgente, pouco urgente, urgente, muito urgente).
-        7. Se não houver anomalias, informe claramente que todos os resultados estão dentro das faixas de referência.
+        4. Explique as possíveis implicações de cada anomalia para a saúde do paciente.
+        5. Não classifique como anomalia valores que estejam dentro da faixa de referência, mesmo que próximos aos limites.
+        6. Se não houver anomalias, informe que todos os valores estão dentro das faixas de referência.
+        7. Caso faltem informações ou valores de referência, indique claramente.
+        8. Sugira possíveis condições de saúde relacionadas às anomalias encontradas, em ordem de probabilidade.
+        9. Recomende exames adicionais ou consultas com especialistas, se necessário.
+        10. Sugira mudanças no estilo de vida ou dieta, se aplicável.
+        11. Forneça uma escala de urgência para procurar atendimento médico (não urgente, pouco urgente, urgente, muito urgente).
 
-        Análise detalhada:
-        {full_analysis}
+        Exame de sangue:
+        {text}
 
-        Resumo e recomendações em português: [/INST]
+        Sua análise em português:
         """
-        summary = get_cached_analysis(summary_prompt)
+        analysis = get_analysis(prompt)
 
-        return f"**Análise Detalhada**:\n\n{full_analysis}\n\n**Resumo e Recomendações**:\n\n{summary}"
+        return f"**Análise Detalhada**:\n\n{analysis}"
 
     except Exception as e:
         logger.error(f"Erro ao processar o arquivo: {str(e)}")
         return f"Erro ao processar o arquivo: {str(e)}"
 
-def chunk_text(text: str, chunk_size: int = 4000) -> list:
-    """Divide o texto em partes menores para análise."""
-    sentences = text.split('.')
-    chunks = []
-    current_chunk = ""
-    
-    for sentence in sentences:
-        if len(current_chunk) + len(sentence) + 1 > chunk_size:
-            chunks.append(current_chunk)
-            current_chunk = sentence + '.'
-        else:
-            current_chunk += (sentence + '.')
-    
-    if current_chunk:
-        chunks.append(current_chunk)
-    return chunks
-
 # Configuração da interface do Gradio
 iface = gr.Interface(
     fn=analyze_blood_test,
-    inputs=[
-        gr.File(label="Envie seu exame de sangue (PDF ou Texto)", type="filepath"),  # Change type to 'filepath'
-    ],
+    inputs=[gr.File(label="Envie seu exame de sangue (PDF ou Texto)", type="filepath")],
     outputs=gr.Textbox(label="Análise do Exame", lines=30),
     title="Análise Automatizada de Exame de Sangue",
     description="""
@@ -221,12 +107,11 @@ iface = gr.Interface(
     allow_flagging="never",
     live=False,
     theme="default",
-    # Removed server_name from here
 )
 
 # Função para iniciar a interface
 def main():
-    iface.launch(server_name="0.0.0.0") # Pass server_name here
+    iface.launch(server_name="0.0.0.0")
 
 if __name__ == "__main__":
     main()
