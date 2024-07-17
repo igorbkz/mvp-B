@@ -1,44 +1,33 @@
 from typing import Union
 import gradio as gr
 from huggingface_hub import InferenceClient, login
-import fitz  # PyMuPDF
+import fitz
 import io
+import re
 import logging
 from functools import lru_cache
 import backoff
 
-# Configuração de logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Configurações da API
 API_URL = 'https://api-inference.huggingface.co/models/mistralai/Mixtral-8x7B-Instruct-v0.1'
 API_KEY = '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'
-MAX_TOKENS = 30000
 
-# Autenticação com Hugging Face Hub
 login(token=API_KEY)
-
 client = InferenceClient(model="mistralai/Mixtral-8x7B-Instruct-v0.1", token=API_KEY)
 
 @lru_cache(maxsize=100)
+@backoff.on_exception(backoff.expo, Exception, max_tries=5, max_time=60)
 def get_cached_analysis(prompt: str, max_new_tokens: int = 4000, temperature: float = 0.3) -> str:
-    """
-    Obtém a resposta da API com tentativas de repetição e caching.
-    """
-    @backoff.on_exception(backoff.expo, Exception, max_tries=5, max_time=60)
-    def request_completion():
-        response_text = ""
-        messages = [{"role": "user", "content": prompt}]
-        for message in client.chat_completion(messages=messages, max_tokens=max_new_tokens, temperature=temperature, stream=True):
-            if message.choices and message.choices[0].delta and message.choices[0].delta.content:
-                response_text += message.choices[0].delta.content
-        return response_text
-
-    return request_completion()
+    response_text = ""
+    messages = [{"role": "user", "content": prompt}]
+    for message in client.chat_completion(messages=messages, max_tokens=max_new_tokens, temperature=temperature, stream=True):
+        if message.choices and message.choices[0].delta and message.choices[0].delta.content:
+            response_text += message.choices[0].delta.content
+    return response_text
 
 def extract_text_from_pdf(file: Union[str, io.BytesIO, bytes]) -> str:
-    """Extrai texto de um arquivo PDF."""
     try:
         if isinstance(file, str):
             doc = fitz.open(file)
@@ -57,8 +46,14 @@ def extract_text_from_pdf(file: Union[str, io.BytesIO, bytes]) -> str:
         logger.error(f"Erro ao extrair texto do PDF: {str(e)}")
         return f"Erro ao extrair texto do PDF: {str(e)}"
 
+def preprocess_text(text: str) -> str:
+    text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r'(?i)\bhemoglobina\b', 'Hb', text)
+    text = re.sub(r'Page \d+ of \d+|\f', '', text)
+    text = re.sub(r'[^\w\s.,;:%/\-()]', '', text)
+    return text
+
 def analyze_blood_test(file: Union[str, io.BytesIO, bytes]) -> str:
-    """Realiza a análise do exame de sangue fornecido."""
     try:
         if isinstance(file, (str, io.BytesIO, bytes)):
             text = extract_text_from_pdf(file) if isinstance(file, (str, io.BytesIO)) else file.read().decode('utf-8')
@@ -68,82 +63,52 @@ def analyze_blood_test(file: Union[str, io.BytesIO, bytes]) -> str:
         if not text.strip():
             return "Erro: O arquivo está vazio ou não foi possível extrair texto."
 
+        text = preprocess_text(text)
+
         prompt = f"""
         <s>[INST] Você é um especialista médico analisando um exame de sangue em português.
         Com base nos resultados fornecidos abaixo, forneça uma análise detalhada e precisa.
 
         Instruções importantes:
-        1. Compare cuidadosamente cada valor com sua faixa de referência correspondente.
+        1. Compare cuidadosamente cada valor com sua faixa de referência correspondente, considerando o sexo do paciente quando aplicável.
         2. Identifique apenas as anomalias reais, onde o valor está fora da faixa de referência.
         3. Para cada anomalia encontrada, informe:
            - O nome do exame
            - O valor obtido
-           - A faixa de referência
+           - A faixa de referência específica para o sexo do paciente
            - Se está acima ou abaixo da faixa
            - A classificação da anomalia (leve, moderada ou grave)
         4. Explique as possíveis implicações de cada anomalia para a saúde do paciente.
         5. Não classifique como anomalia valores que estejam dentro da faixa de referência, mesmo que próximos aos limites.
         6. Se não houver anomalias, informe que todos os valores estão dentro das faixas de referência.
         7. Caso faltem informações ou valores de referência, indique claramente.
+        8. Sugira possíveis condições de saúde relacionadas às anomalias encontradas, em ordem de probabilidade.
+        9. Recomende exames adicionais ou consultas com especialistas, se necessário.
+        10. Sugira mudanças no estilo de vida ou dieta, se aplicável.
+        11. Forneça uma escala de urgência para procurar atendimento médico (não urgente, pouco urgente, urgente, muito urgente).
 
         Exame de sangue:
         {text}
 
-        Sua análise em português: [/INST]
+        Sua análise detalhada em português: [/INST]
         """
-        full_analysis = get_cached_analysis(prompt)
+        analysis = get_cached_analysis(prompt)
 
-        summary_prompt = f"""
-        <s>[INST] Com base na análise detalhada do exame de sangue, forneça um resumo conciso dos principais achados em português.
-
-        Instruções para o resumo:
-        1. Liste apenas as anomalias reais encontradas, incluindo:
-           - Nome do exame
-           - Valor obtido
-           - Faixa de referência
-           - Se está acima ou abaixo da faixa
-           - Classificação da anomalia (leve, moderada ou grave)
-        2. Para cada anomalia, explique brevemente as possíveis implicações para a saúde.
-        3. Sugira possíveis condições de saúde relacionadas às anomalias encontradas, em ordem de probabilidade.
-        4. Recomende exames adicionais ou consultas com especialistas, se necessário.
-        5. Sugira mudanças no estilo de vida ou dieta, se aplicável.
-        6. Forneça uma escala de urgência para procurar atendimento médico (não urgente, pouco urgente, urgente, muito urgente).
-        7. Se não houver anomalias, informe claramente que todos os resultados estão dentro das faixas de referência.
-
-        Análise detalhada:
-        {full_analysis}
-
-        Resumo e recomendações em português: [/INST]
-        """
-        summary = get_cached_analysis(summary_prompt)
-
-        return f"**Análise Detalhada**:\n\n{full_analysis}\n\n**Resumo e Recomendações**:\n\n{summary}"
+        return analysis
 
     except Exception as e:
         logger.error(f"Erro ao processar o arquivo: {str(e)}")
         return f"Erro ao processar o arquivo: {str(e)}"
 
-# Configuração da interface do Gradio
 iface = gr.Interface(
     fn=analyze_blood_test,
     inputs=[gr.File(label="Envie seu exame de sangue (PDF ou Texto)", type="filepath")],
     outputs=gr.Textbox(label="Análise do Exame", lines=30),
     title="Análise Automatizada de Exame de Sangue",
-    description="""
-    Esta ferramenta analisa automaticamente exames de sangue em português.
-    Envie um arquivo PDF ou TXT contendo os resultados do seu exame.
-    A análise inclui uma interpretação detalhada dos resultados, identificação de anomalias reais,
-    classificação de gravidade e recomendações gerais.
-
-    <b>Nota:</b> Esta ferramenta não substitui a avaliação de um profissional de saúde.
-    Sempre consulte seu médico para interpretação oficial dos resultados.
-    """,
     allow_flagging="never",
     live=False,
-    theme="default",
 )
 
-# Função para iniciar a interface
 def main():
     iface.launch(server_name="0.0.0.0")
 
