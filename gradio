@@ -8,9 +8,11 @@ import logging
 from functools import lru_cache
 import backoff
 
+# Configuração do Logger
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Configuração da API
 API_URL = 'https://api-inference.huggingface.co/models/mistralai/Mixtral-8x7B-Instruct-v0.1'
 API_KEY = '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'
 
@@ -19,15 +21,22 @@ client = InferenceClient(model="mistralai/Mixtral-8x7B-Instruct-v0.1", token=API
 
 @lru_cache(maxsize=100)
 @backoff.on_exception(backoff.expo, Exception, max_tries=5, max_time=60)
-def get_cached_analysis(prompt: str, max_new_tokens: int = 4000, temperature: float = 0.3) -> str:
+def get_cached_analysis(prompt: str, max_new_tokens: int = 4000, temperature: float = 0.2) -> str:
+    """Obtém a análise de um prompt usando o modelo de IA."""
     response_text = ""
     messages = [{"role": "user", "content": prompt}]
-    for message in client.chat_completion(messages=messages, max_tokens=max_new_tokens, temperature=temperature, stream=True):
-        if message.choices and message.choices[0].delta and message.choices[0].delta.content:
-            response_text += message.choices[0].delta.content
+    try:
+        for message in client.chat_completion(
+                messages=messages, max_tokens=max_new_tokens, temperature=temperature, stream=True):
+            if message.choices and message.choices[0].delta and message.choices[0].delta.content:
+                response_text += message.choices[0].delta.content
+    except Exception as e:
+        logger.error(f"Erro durante a geração da análise: {str(e)}")
+        return f"Erro durante a geração da análise: {str(e)}"
     return response_text
 
 def extract_text_from_pdf(file: Union[str, io.BytesIO, bytes]) -> str:
+    """Extrai texto de um arquivo PDF."""
     try:
         if isinstance(file, str):
             doc = fitz.open(file)
@@ -36,27 +45,64 @@ def extract_text_from_pdf(file: Union[str, io.BytesIO, bytes]) -> str:
         elif isinstance(file, bytes):
             doc = fitz.open(stream=file, filetype="pdf")
         else:
-            return "Erro: Formato de arquivo não suportado."
+            raise ValueError("Formato de arquivo não suportado.")
 
-        text = ""
-        for page in doc:
-            text += page.get_text()
+        text = "".join([page.get_text() for page in doc])
+        if not text.strip():
+            raise ValueError("O PDF está vazio ou não possui texto extraível.")
         return text
     except Exception as e:
         logger.error(f"Erro ao extrair texto do PDF: {str(e)}")
         return f"Erro ao extrair texto do PDF: {str(e)}"
 
 def preprocess_text(text: str) -> str:
-    text = re.sub(r'\s+', ' ', text)
-    text = re.sub(r'(?i)\bhemoglobina\b', 'Hb', text)
-    text = re.sub(r'Page \d+ of \d+|\f', '', text)
-    text = re.sub(r'[^\w\s.,;:%/\-()]', '', text)
-    return text
+    """Pré-processa o texto para análise."""
+    try:
+        text = re.sub(r'\s+', ' ', text)
+        text = re.sub(r'(?i)\bhemoglobina\b', 'Hb', text)
+        text = re.sub(r'Page \d+ of \d+|\f', '', text)
+        text = re.sub(r'[^\w\s.,;:%/\-()]', '', text)
+        return text.strip()
+    except Exception as e:
+        logger.error(f"Erro durante o pré-processamento do texto: {str(e)}")
+        return f"Erro durante o pré-processamento do texto: {str(e)}"
+
+def extract_reference_values(exam_text: str) -> dict:
+    """Extrai os valores de referência do texto do exame."""
+    reference_values = {}
+    pattern = re.compile(r'(\w+):\s*([\d.]+)-([\d.]+)\s*mg/dL')
+    matches = pattern.findall(exam_text)
+    for match in matches:
+        test_name = match[0]
+        lower_bound = float(match[1])
+        upper_bound = float(match[2])
+        reference_values[test_name] = (lower_bound, upper_bound)
+    return reference_values
+
+def extract_test_results(exam_text: str) -> dict:
+    """Extrai os resultados dos testes do texto do exame."""
+    test_results = {}
+    pattern = re.compile(r'(\w+):\s*([\d.]+)\s*mg/dL')
+    matches = pattern.findall(exam_text)
+    for match in matches:
+        test_name = match[0]
+        result_value = float(match[1])
+        test_results[test_name] = result_value
+    return test_results
+
+def validate_analysis(analysis: str) -> str:
+    """Valida a análise retornada pelo modelo."""
+    if not analysis.strip():
+        return "Erro: A análise retornada pelo modelo está vazia."
+    if "Erro" in analysis:
+        return analysis
+    return analysis
 
 def analyze_blood_test(file: Union[str, io.BytesIO, bytes]) -> str:
+    """Analisa um exame de sangue fornecido em PDF ou texto."""
     try:
         if isinstance(file, (str, io.BytesIO, bytes)):
-            text = extract_text_from_pdf(file) if isinstance(file, (str, io.BytesIO)) else file.read().decode('utf-8')
+            text = extract_text_from_pdf(file)
         else:
             return "Erro: Formato de arquivo não suportado."
 
@@ -64,6 +110,8 @@ def analyze_blood_test(file: Union[str, io.BytesIO, bytes]) -> str:
             return "Erro: O arquivo está vazio ou não foi possível extrair texto."
 
         text = preprocess_text(text)
+        reference_values = extract_reference_values(text)
+        test_results = extract_test_results(text)
 
         prompt = f"""
         <s>[INST] Você é um especialista médico analisando um exame de sangue em português.
@@ -87,15 +135,14 @@ def analyze_blood_test(file: Union[str, io.BytesIO, bytes]) -> str:
         10. Sugira mudanças no estilo de vida ou dieta, se aplicável.
         11. Forneça uma escala de urgência para procurar atendimento médico (não urgente, pouco urgente, urgente, muito urgente).
 
-        Exame de sangue:
+        Exame de sangue: 
         {text}
 
         Sua análise detalhada em português: [/INST]
         """
-        analysis = get_cached_analysis(prompt)
-
-        return analysis
-
+        analysis = get_cached_analysis(prompt, max_new_tokens=4000, temperature=0.2)
+        validated_analysis = validate_analysis(analysis)
+        return validated_analysis
     except Exception as e:
         logger.error(f"Erro ao processar o arquivo: {str(e)}")
         return f"Erro ao processar o arquivo: {str(e)}"
